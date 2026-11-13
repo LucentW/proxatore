@@ -144,8 +144,7 @@ function fetchContent(string $url, int $redirects=-1): array {
         return ['body' => false, 'code' => 0, 'url' => $url];
     }
     $ch = curl_init();
-    curl_setopt($ch, CURLOPT_PROTOCOLS_STR, 'http,https');
-    curl_setopt($ch, CURLOPT_REDIRECT_PROTOCOLS_STR, 'http,https');
+    curl_setopt($ch, CURLOPT_PROTOCOLS_STR, 'http,https'); // libcurl applies this to redirects too
     // abort (by returning a wrong length) if a redirect points to a non-public host
     curl_setopt($ch, CURLOPT_HEADERFUNCTION, function ($ch, $header) {
         if (stripos($header, 'location:') === 0) {
