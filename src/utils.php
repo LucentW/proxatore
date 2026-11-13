@@ -145,6 +145,9 @@ function fetchContent(string $url, int $redirects=-1): array {
     }
     $ch = curl_init();
     curl_setopt($ch, CURLOPT_PROTOCOLS_STR, 'http,https'); // libcurl applies this to redirects too
+    // nginx gives up on us after 60s: fail before that instead of turning a slow upstream into a 504
+    curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, 10);
+    curl_setopt($ch, CURLOPT_TIMEOUT, 25);
     // abort (by returning a wrong length) if a redirect points to a non-public host
     curl_setopt($ch, CURLOPT_HEADERFUNCTION, function ($ch, $header) {
         if (stripos($header, 'location:') === 0) {
@@ -407,6 +410,7 @@ function postRequest(string $url, string $body, array $headers=null): string|fal
         'header' => $headers,
         'method' => 'POST',
         'content' => $body,
+        'timeout' => 20,
     ]]));
 }
 
@@ -414,7 +418,10 @@ function getCobaltVideo(string $url): string|null {
     $cobaltData = json_decode(postRequest(COBALT_API, json_encode(['url' => $url]), [
         'Accept: application/json',
         'Content-Type: application/json',
-    ]));
+    ]) ?: 'null');
+    if (!$cobaltData) {
+        return null; // cobalt down, slow or answering garbage: carry on without it
+    }
     if ($cobaltData->status === 'redirect' && strpos($cobaltData->url, '.mp4')) {
         return $cobaltData->url;
     } else if ($cobaltData->status === 'tunnel' && strpos($cobaltData->filename, '.mp4')) {
@@ -588,7 +595,8 @@ function backgroundExec(string $command): void {
     if (explode(' ', php_uname('s'))[0] === "Windows") {
         pclose(popen("start /B {$command} &", 'r'));
     } else {
-        shell_exec("{$command} &");
+        // detach stdout/stderr, otherwise shell_exec waits for the background job to finish
+        shell_exec("{$command} >/dev/null 2>&1 &");
     }
 }
 
