@@ -5,81 +5,121 @@
  *
 */
 
-// require 'vendor/OcttDb/index.php';
+// History lives in a SQLite DB (HISTORY_DB), entries expire after HISTORY_TTL seconds.
+// Every failure here is non-fatal: history is a nice-to-have, never take the page down for it.
 
-function loadHistory(): array {
-    $history = [];
-    if (file_exists(HISTORY_FILE)) {
-        $lines = file(HISTORY_FILE, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
-        foreach ($lines as $line) {
-            if ($item = json_decode($line, true)) {
-                $history[] = $item;
+function historyDb(): PDO {
+    static $db = null;
+    if ($db) {
+        return $db;
+    }
+    if (!is_dir(DATA_FOLDER)) {
+        mkdir(DATA_FOLDER, 0777, true);
+    }
+    $db = new PDO('sqlite:' . HISTORY_DB, null, null, [
+        PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
+        PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
+    ]);
+    $db->exec('PRAGMA busy_timeout = 5000');
+    $db->exec('PRAGMA auto_vacuum = FULL'); // only takes effect on a fresh DB: freed pages are returned to the OS on commit
+    $db->exec('PRAGMA journal_mode = WAL'); // readers don't block the writer
+    $db->exec('PRAGMA synchronous = NORMAL');
+    $db->exec('CREATE TABLE IF NOT EXISTS history (
+        platform TEXT NOT NULL,
+        relativeurl TEXT NOT NULL,
+        data TEXT NOT NULL,
+        updated INTEGER NOT NULL,
+        PRIMARY KEY (platform, relativeurl)
+    ) WITHOUT ROWID');
+    $db->exec('CREATE INDEX IF NOT EXISTS history_updated ON history (updated)');
+    return $db;
+}
+
+function historyCutoff(): int {
+    return time() - HISTORY_TTL;
+}
+
+// drop expired entries and their cached files
+function pruneHistory(PDO $db): void {
+    $db->prepare('DELETE FROM history WHERE updated < ?')->execute([historyCutoff()]);
+    if (is_dir(CACHE_FOLDER)) {
+        $files = new RecursiveIteratorIterator(new RecursiveDirectoryIterator(CACHE_FOLDER, FilesystemIterator::SKIP_DOTS));
+        foreach ($files as $file) {
+            if ($file->isFile() && $file->getMTime() < historyCutoff()) {
+                @unlink($file->getPathname());
             }
         }
     }
-    return $history;
 }
 
 function saveHistory(array $entry): void {
     if (!SAVE_HISTORY) {
         return;
     }
-    mkdir(HISTORY_FOLDER . $entry['platform'], 0777, true);
-    // TODO truncate relativeurl & append hash: base64url_encode(sha1($entry['relativeurl'], true))
-    file_put_contents(HISTORY_FOLDER . $entry['platform'] . '/' . urlencode($entry['relativeurl']) . '.json', dataJsonEncode($entry));
-    backgroundExec("php cacher.php {$entry['platform']} " . urlencode($entry['relativeurl']));
-    if (inPlatformArray($entry['platform'], PLATFORMS_FAKE404)) {
-        $history = searchExactHistory($entry['platform'], implode('/', array_slice(explode('/', $entry['relativeurl']), -1)));
-        if (sizeof($history)) {
-            unset($history[0]['relativeurl']);
-            unset($entry['relativeurl']);
-            if (dataJsonEncode($history[0]) === dataJsonEncode($entry)) {
-                return;
-            } else {
-                // TODO update cache of main page
+    if ($entry['image'] ?? null) {
+        backgroundExec('php cacher.php ' . escapeshellarg($entry['image']));
+    }
+    try {
+        if (inPlatformArray($entry['platform'], PLATFORMS_FAKE404)) {
+            $main = searchExactHistory($entry['platform'], implode('/', array_slice(explode('/', $entry['relativeurl']), -1)));
+            if (sizeof($main)) {
+                unset($main[0]['relativeurl']);
+                $entry2 = $entry;
+                unset($entry2['relativeurl']);
+                if (dataJsonEncode($main[0]) === dataJsonEncode($entry2)) {
+                    return;
+                }
             }
-        } else {
             // TODO update cache of main page
         }
+        $db = historyDb();
+        $db->prepare('INSERT INTO history (platform, relativeurl, data, updated) VALUES (?, ?, ?, ?)
+            ON CONFLICT (platform, relativeurl) DO UPDATE SET data = excluded.data, updated = excluded.updated')
+            ->execute([$entry['platform'], $entry['relativeurl'], dataJsonEncode($entry), time()]);
+        if (random_int(1, 100) === 1) { // cheap enough to do now and then, no need for a cron
+            pruneHistory($db);
+        }
+    } catch (Throwable $e) {
+        error_log('history: ' . $e->getMessage());
     }
-    $history = loadHistory();
-    $history = array_filter($history, function ($item) use ($entry) {
-        return (($item['platform'] !== $entry['platform']) ||
-                ($item['relativeurl'] !== $entry['relativeurl']));
-    });
-    $history[] = $entry;
-    $lines = array_map(fn($item) => dataJsonEncode($item), $history);
-    file_put_contents(HISTORY_FILE, implode(PHP_EOL, $lines) . PHP_EOL, LOCK_EX);
 }
 
 function searchHistory(string $query): array {
     $results = $fake404 = [];
-    foreach (loadHistory() as $entry) {
-        if (stripos(dataJsonEncode($entry), $query) !== false) {
+    try {
+        $stmt = historyDb()->prepare("SELECT data FROM history WHERE updated >= ? AND data LIKE ? ESCAPE '\\' ORDER BY updated DESC");
+        $stmt->execute([historyCutoff(), '%' . addcslashes($query, '%_\\') . '%']);
+        while (sizeof($results) < SEARCH_LIMIT && ($row = $stmt->fetch())) {
+            $entry = json_decode($row['data'], true);
             if (inPlatformArray($entry['platform'], PLATFORMS_FAKE404)) {
+                // collapse entries that only differ by their URL
                 $entry2 = $entry;
                 unset($entry2['relativeurl']);
-                foreach ($fake404 as $item) {
-                    if (dataJsonEncode($entry2) === dataJsonEncode($item)) {
-                        goto skip;
-                    }
+                $key = dataJsonEncode($entry2);
+                if (isset($fake404[$key])) {
+                    continue;
                 }
-                $fake404[] = $entry2;
+                $fake404[$key] = true;
             }
             $results[] = $entry;
-            skip:
         }
+    } catch (Throwable $e) {
+        error_log('history: ' . $e->getMessage());
     }
-    return array_slice($results, 0, SEARCH_LIMIT);
+    return $results;
 }
 
 function searchExactHistory(string $platform, string $relativeUrl): array {
-    return searchHistory(dataJsonEncode([
-        'platform' => $platform,
-        'relativeurl' => $relativeUrl,
-    ]));
+    try {
+        $stmt = historyDb()->prepare('SELECT data FROM history WHERE platform = ? AND relativeurl = ? AND updated >= ?');
+        $stmt->execute([$platform, $relativeUrl, historyCutoff()]);
+        return ($row = $stmt->fetch()) ? [json_decode($row['data'], true)] : [];
+    } catch (Throwable $e) {
+        error_log('history: ' . $e->getMessage());
+        return [];
+    }
 }
 
 function dataJsonEncode(mixed $data): string {
-    return json_encode($data, JSON_UNESCAPED_SLASHES);
+    return json_encode($data, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
 }

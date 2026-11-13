@@ -37,9 +37,12 @@ define('USER_AGENT', "Proxatore/2025/1 ({$_SERVER['HTTP_HOST']})");
 
 define('SCRIPT_NAME', str_starts_with($_SERVER['REQUEST_URI'], $_SERVER['SCRIPT_NAME']) ? "{$_SERVER['SCRIPT_NAME']}/" : '/');
 
-const HISTORY_FILE = '/run/Proxatore.history.jsonl';
-const HISTORY_FOLDER = '/run/history.d/';
-const CACHE_FOLDER = '/run/cache.d/';
+// writable folder for the history DB and the media cache; bind-mount it to persist across restarts
+const DATA_FOLDER = '/var/lib/proxatore/';
+const HISTORY_DB = DATA_FOLDER . 'history.sqlite';
+const CACHE_FOLDER = DATA_FOLDER . 'cache.d/';
+// history entries (and cached media) older than this are dropped; viewing an item again renews it
+const HISTORY_TTL = 30 * 24 * 3600;
 
 // const OPTIONS_OVERRIDES = [
 //     'bbs.spacc.eu.org' => [

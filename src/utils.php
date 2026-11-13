@@ -105,8 +105,58 @@ function getRequestProtocol(): string {
     return $_SERVER['REQUEST_SCHEME'] ?? (($_SERVER['HTTPS'] ?? null) === 'on' ? 'https' : 'http');
 }
 
+// SSRF guard: true only if every address the host resolves to is public
+// ponytail: check-then-fetch, DNS rebinding can still race it; pin with CURLOPT_RESOLVE if that matters
+function isPublicUrl(string $url): bool {
+    if (str_starts_with($url, '//')) {
+        $url = "http:{$url}";
+    } else if (!preg_match('#^[a-z][a-z0-9+.-]*://#i', $url)) {
+        $url = "http://{$url}"; // curl also assumes http for scheme-less URLs
+    }
+    $host = trim(parse_url($url, PHP_URL_HOST) ?? '', '[]');
+    if (!$host) {
+        return false;
+    }
+    $ips = filter_var($host, FILTER_VALIDATE_IP) ? [$host] : (gethostbynamel($host) ?: []);
+    foreach ($ips as $ip) {
+        if (!filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE)) {
+            return false;
+        }
+    }
+    return (bool)$ips;
+}
+
+// platforms we know how to talk to: exact names, or user sites like foo.neocities.org
+function isKnownPlatform(string $platform): bool {
+    if (isExactPlatformName($platform)) {
+        return true;
+    }
+    foreach (PLATFORMS_USERSITES as $domain) {
+        if (str_ends_with($platform, ".{$domain}")) {
+            return true;
+        }
+    }
+    return false;
+}
+
 function fetchContent(string $url, int $redirects=-1): array {
+    if (!isPublicUrl($url)) {
+        return ['body' => false, 'code' => 0, 'url' => $url];
+    }
     $ch = curl_init();
+    curl_setopt($ch, CURLOPT_PROTOCOLS_STR, 'http,https');
+    curl_setopt($ch, CURLOPT_REDIRECT_PROTOCOLS_STR, 'http,https');
+    // abort (by returning a wrong length) if a redirect points to a non-public host
+    curl_setopt($ch, CURLOPT_HEADERFUNCTION, function ($ch, $header) {
+        if (stripos($header, 'location:') === 0) {
+            $target = trim(substr($header, 9));
+            // relative redirects stay on the already-checked host
+            if (preg_match('#^([a-z][a-z0-9+.-]*:)?//#i', $target) && !isPublicUrl($target)) {
+                return 0;
+            }
+        }
+        return strlen($header);
+    });
     $useragent = 'curl/' . curl_version()['version']; // format the UA like curl CLI otherwise some sites can't behave
     // $useragent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36';
     // $useragent = 'node';
@@ -217,7 +267,7 @@ function parseMetaTags(DOMDocument $doc): array {
 function htmldom(string $body): DOMDocument {
     libxml_use_internal_errors(true);
     $doc = new DOMDocument();
-    $doc->loadHTML(mb_convert_encoding($body, 'HTML-ENTITIES', 'UTF-8'));
+    $doc->loadHTML('<?xml encoding="UTF-8">' . $body);
     libxml_clear_errors();
     return $doc;
 }
@@ -378,12 +428,19 @@ function getCobaltVideo(string $url): string|null {
 function fetchPageMedia(array &$item): void {
     $platform = $item['result']['platform'];
     $relativeUrl = $item['result']['relativeurl'];
+    // reuse the page already fetched by getPageData when the media URL is that same page
+    $mediaBody = function () use ($item) {
+        $url = makeMediaScrapeUrl($item);
+        return ($url === ($item['url'] ?? null) && is_string($item['body'] ?? null))
+            ? $item['body']
+            : fetchContent($url)['body'];
+    };
     if ($api = platformMapGet($platform, PLATFORMS_API)) {
         $json = null;
         if ($apiUrl = $api['url'] ?? null) {
             $json = fetchContent($apiUrl . urlLast($relativeUrl))['body'];
         } else {
-            $doc = htmldom(fetchContent(makeMediaScrapeUrl($item))['body']);
+            $doc = htmldom($mediaBody());
             if ($id = $api['id'] ?? null) {
                 $json = $doc->getElementById($id)->textContent;
             } else if ($tag = $api['tag'] ?? null) {
@@ -394,7 +451,13 @@ function fetchPageMedia(array &$item): void {
         $data = json_decode($json, true);
         $values = [];
         foreach ($api['data'] as $key => $query) {
-            $values[$key] = eval("return \$data{$query};");
+            // query like ['a'][0]['b']: walk the keys instead of eval()
+            preg_match_all("/\[(?:'([^']*)'|(\d+))\]/", $query, $m, PREG_SET_ORDER);
+            $v = $data;
+            foreach ($m as $k) {
+                $v = $v[($k[2] ?? '') !== '' ? (int)$k[2] : $k[1]] ?? null;
+            }
+            $values[$key] = $v;
         }
         $item['result'] = array_merge($item['result'], $values);
     } else {
@@ -402,7 +465,7 @@ function fetchPageMedia(array &$item): void {
         if (COBALT_API && inPlatformArray($platform, PLATFORMS_COBALT)) {
             $cobaltVideo = getCobaltVideo($item['url']);
         }
-        $html = fetchContent(makeMediaScrapeUrl($item))['body'];
+        $html = $mediaBody();
         if (!$item['result']['video']) {
             $item['result']['video'] = $cobaltVideo ?? getAnyVideoUrl($html) ?? '';
         }
@@ -427,7 +490,7 @@ function fetchPageMedia(array &$item): void {
 
 function getWebStreamUrls(string $absoluteUrl, string $options=''): array|null {
     if (($url = parseAbsoluteUrl($absoluteUrl)) && ($url = preg_replace('/[^A-Za-z0-9-_\/\.]/', '', $url))) {
-        return explode("\n", trim(shell_exec("yt-dlp {$options} -g 'https://{$url}'")));
+        return explode("\n", trim(shell_exec("yt-dlp {$options} -g -- " . escapeshellarg("https://{$url}"))));
     } else {
         return null;
     }
@@ -443,10 +506,10 @@ function ffmpegStream(string $absoluteUrl): void {
     if ($urls = getWebStreamUrls($absoluteUrl, '--user-agent "' . USER_AGENT . '"')) {
         $inputs = '';
         foreach ($urls as $url) {
-            $inputs .= " -i '{$url}' ";
+            $inputs .= ' -i ' . escapeshellarg($url) . ' ';
         }
         header('Content-Type: video/mp4');
-        passthru("ffmpeg -user_agent '" . USER_AGENT . "' {$inputs} -c:v copy -f ismv -");
+        passthru('ffmpeg -user_agent ' . escapeshellarg(USER_AGENT) . " {$inputs} -c:v copy -f ismv -");
     }
     die();
 }
@@ -459,9 +522,14 @@ function streamFile(string $url, string $mime): void {
 
 // TODO: redesign the endpoint names, they're kind of a mess
 function handleApiRequest(array $segments): void {
-	$api = substr($segments[0], 2, -2);
-    $platform = $segments[1];
+    $api = substr($segments[0], 2, -2);
+    $platform = $segments[1] ?? '';
     $relativeUrl = implode('/', array_slice($segments, 2));
+    // $platform ends up in outbound URLs (yt-dlp, ffmpeg, redirects): never let it be an arbitrary host
+    if (!in_array($api, ['cobaltproxy', 'randominstance']) && !isKnownPlatform($platform)) {
+        http_response_code(404);
+        die();
+    }
     if (($api === 'proxy' || $api === 'media')) {
         if ($platform === 'youtube') {
             header('Location: ' . getYoutubeStreamUrl($relativeUrl));
@@ -481,6 +549,11 @@ function handleApiRequest(array $segments): void {
                 ffmpegStream(makeCanonicalBareUrl($platform, lstrip($relativeUrl, '/', 3)));
         }
     } else if ($api === 'cobaltproxy') {
+        // only cobalt tunnels (see getCobaltVideo), not its other endpoints
+        if (!str_starts_with($relativeUrl, 'tunnel') || str_contains($relativeUrl, '..')) {
+            http_response_code(404);
+            die();
+        }
         streamFile(COBALT_API . $relativeUrl, 'video/mp4');
     } else if ($api === 'embed') {
         header('Location: ' . makeEmbedUrl($platform, $relativeUrl));

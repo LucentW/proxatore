@@ -1,5 +1,4 @@
-ARG ALPINE_VERSION=3.22
-FROM alpine:${ALPINE_VERSION}
+FROM alpine:3.24
 
 WORKDIR /var/www/html
 
@@ -12,6 +11,9 @@ RUN apk add --no-cache \
   php84-dom \
   php84-fpm \
   php84-mbstring \
+  php84-opcache \
+  php84-pdo \
+  php84-pdo_sqlite \
   php84-openssl \
   php84-xml \
   yt-dlp \
@@ -33,7 +35,11 @@ COPY config/php.ini ${PHP_INI_DIR}/conf.d/custom.ini
 COPY config/supervisord.conf /etc/supervisor/conf.d/supervisord.conf
 
 # Make sure files/folders needed by the processes are accessable when they run under the nobody user
-RUN chown -R nobody:nobody /var/www/html /run /var/lib/nginx /var/log/nginx
+RUN mkdir -p /var/lib/proxatore \
+  && chown -R nobody:nobody /var/www/html /run /var/lib/nginx /var/log/nginx /var/lib/proxatore
+
+# History DB + media cache; bind-mount a host dir owned by uid 65534 (nobody) here to persist it
+VOLUME /var/lib/proxatore
 
 # Switch to use a non-root user from here on
 USER nobody

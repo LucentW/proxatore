@@ -2,4 +2,5 @@
 history.jsonl
 history.d/
 cache.d/
+data/
 docker-compose.yml

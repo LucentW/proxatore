@@ -7,6 +7,9 @@ services:
     restart: unless-stopped
     ports:
       - 8080:8080
+    volumes:
+      # history DB + media cache; the host dir must be writable by uid 65534 (nobody)
+      - ./data:/var/lib/proxatore
     depends_on:
       - cobalt
 
